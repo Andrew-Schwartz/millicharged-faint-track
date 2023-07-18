@@ -7,6 +7,7 @@ import math
 import numpy as np
 from numba import cuda, vectorize, NumbaPerformanceWarning, njit
 from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_normal_float32
+from numba.cuda.cudadrv.devicearray import DeviceNDArray
 import warnings
 import cupy as cp
 from cucim.skimage.feature import peak_local_max
@@ -14,7 +15,7 @@ from time import perf_counter_ns
 
 import gpu_random
 
-# Filter out the NumbaPerformanceWarning
+# Filter out the NumbaPerformanceWarning (it warns for small grid size, but that can't be avoided in some cases here)
 warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
 
 # Constants
@@ -42,12 +43,12 @@ length_target = 74  # cm
 @njit(nogil=True)
 def intercept(y_end: float, back: bool, y: float) -> float:
     """
-    For a given height (cm) on far side of the detector, calculate the point on the
-    close side that is on a line between the far point and one of four boundary points
-    of the target.
-    :param y_end: the y coordinate of the end point, `f` in Desmos
+    For a given height (cm) on far side of the detector, calculate the point on the close side that is on a line between
+    the far point and one of four boundary points of the target.
+    This function is called l in the Desmos: https://www.desmos.com/calculator/gncrncjxhi.
+    :param y_end: the y coordinate of the end point in cm, `f` in Desmos
     :param back: true if the point is the back of the target, false for the front point, `b` Desmos
-    :param y: y_min or y_max, `i` in Desmos
+    :param y: y_min or y_max in cm, `i` in Desmos
     """
     back_length = length_target if back else 0
     slope = (y_end - y) / (target + length_wires + back_length)
@@ -55,13 +56,22 @@ def intercept(y_end: float, back: bool, y: float) -> float:
 
 
 @cuda.jit
-def intercept_kern(y_end, back, y, out):
+def intercept_kern(y_end: cp.ndarray, back: cp.ndarray, y: float, out: cp.ndarray):
+    """
+    Calculate the intercept for many `y_end`s at once.
+    """
     idx = cuda.grid(1)
     if idx < len(y_end):
         out[idx] = intercept(y_end[idx], back[idx], y)
 
 
 def delta_ticks(y_end: float) -> float:
+    """
+    For a given height (cm) on the far side of the detector, calculate how many ticks are between the points on the
+    close side of the detector on lines from that far side point to the top/bottom of the target.
+    This function is the last equation in the Desmos, l(...1)-l(...0): https://www.desmos.com/calculator/gncrncjxhi.
+    :param y_end: the y coordinate of the end point in cm, `f` in Desmos
+    """
     max_intercept = intercept(y_end, y_end > y_max, y_max)
     min_intercept = intercept(y_end, y_end < y_min, y_min)
     delta_ticks_cm = max_intercept - min_intercept
@@ -78,7 +88,11 @@ print(f'tick_separation = {tick_separation}')
 
 
 @cuda.jit
-def get_start_end_pairs_kern(rng_states, pairs):
+def get_start_end_pairs_kern(rng_states: DeviceNDArray, pairs: cp.ndarray):
+    """Populate `pairs` with pairs of (start, end) ticks that form a line to the target.
+
+    Important: `len(rng_states) >= len(pairs)`
+    """
     idx = cuda.grid(1)
     if idx < pairs.shape[0]:
         y1 = gpu_random.uniform(rng_states, idx, 0, nticks)
@@ -92,8 +106,13 @@ def get_start_end_pairs_kern(rng_states, pairs):
         pairs[idx, 1] = y1
 
 
-def get_start_end_pairs(n_pairs, rng_states):
+def get_start_end_pairs(n_pairs: int, rng_states: DeviceNDArray):
+    """Get `n_pairs` pairs of (start, end) ticks on a line pointing to the target.
+
+    :return: A 2d cp.ndarray with shape (npairs, 2).
+    """
     pairs = cp.empty((n_pairs, 2))
+    # is a custom kernel because doing a python loop over each wire with cp.roll was slow
     get_start_end_pairs_kern.forall(n_pairs)(rng_states, pairs)
     return pairs
 
@@ -177,19 +196,19 @@ def gen_noise():
 
     This is the starting point of the simulation.
 
-    Returns a 2d cp.ndarray
+    :return: A 2d cp.ndarray with shape (nwires, nticks)
     """
-
+    # from sbndcode
     poisson_mu = 3.30762
     # generate the poisson random numbers
     poisson_random = cp.random.poisson(poisson_mu, nwires * nticks, dtype=np.float32) / poisson_mu
-    # cp.random.poisson can only generate 1d arrays, so reshape it to be 2d for ease of access
+    # cp.random.poisson can only generate 1d arrays, so reshape it to be 2d (same total size, so doesn't copy)
     poisson_random = cp.reshape(poisson_random, (nwires, nticks))
 
     # generate the random phase
     uniform_random = cp.random.uniform(0, 2 * math.pi, (nwires, nticks))
 
-    # generate tick number for each wire
+    # generate tick number for each wire: (0, 1, 2, 3, 4, 5, ..., nticks - 1) copied nwires times
     ticks = cp.tile(cp.arange(nticks, dtype=np.int16), (nwires, 1))
 
     # calculate frequencies
@@ -205,14 +224,28 @@ def gen_noise():
 
 @cuda.jit
 def shuffle_noise_kern(noise, new_noise, indices, roll_amounts):
+    """
+    
+    """
     w, t = cuda.grid(2)
     if w < nwires and t < nticks:
+        # shuffle wires
         new_w = indices[w]
+        # roll noise values along each wire
         new_t = (t + roll_amounts[w]) % nticks
         new_noise[new_w, new_t] = noise[w, t]
 
 
-def shuffle_noise(noise):
+def shuffle_noise(noise: cp.ndarray):
+    """Take a wire noise array from gen_noise and shuffle it to make a new noise array.
+
+    Running 1664 ifft's is pretty slow, so we skip those by only generating "true" noise every few runs. Instead, this
+    function will rearrange the order of the wires (since each has independent noise) and will roll the noise values
+    along each wire by random amounts.
+
+    :param noise: A 2d cp.ndarray with shape (nwires, nticks) of noise generated by gen_noise
+    :return: A new 2d cp.ndarray with shape (nwires, nticks)
+    """
     new_noise = cp.empty_like(noise)
     # wire at noise[0] goes into new_noise[indices[0]]
     indices = cp.arange(0, nwires)
@@ -225,10 +258,14 @@ def shuffle_noise(noise):
 
 
 @vectorize(['int32(float32)'], target='cuda')
-def get_n_ionization_electrons(energy_loss):
+def get_n_ionization_electrons(energy_loss: np.float32):
+    """GPU vectorized function to convert energy losses into #s of electrons that get detected
+    :param energy_loss: energy loss in MeV
+    :return: num of electrons that make it to readout
+    """
     # convert to eV, get rid of negatives, and put in an upper threshold (otherwise, the
     # long tail of the landau makes some super huge values wash everything else out)
-    # todo eventually ask Mastbaum if this 1e5 cutoff makes sense
+    # todo eventually ask Mastbaum if this cutoff makes sense
     energy_loss = min(max(1e6 * energy_loss, 0), energy_loss_cutoff)
     # number of elections ionized
     n_electrons = energy_loss / energy_per_electron
@@ -240,23 +277,41 @@ MAX_IONIZATION_ELECTRONS = int(energy_loss_cutoff / energy_per_electron * surviv
 
 
 @cp.fuse
-def get_sigma_x(x):
+def get_sigma_x(x: np.float32):
+    """GPU vectorized function to convert distance to readout to Gaussian width of spread
+    :param x: Distance from interaction to readout plane, cm
+    :return: Gaussian width, cm
+    """
     # drift time, μs
     t = x / v_d
     # equation 3.1 of https://iopscience.iop.org/article/10.1088/1748-0221/16/09/P09025/pdf
-    # this is the width on the collection plane (μs²)
+    # this is the width on the collection plane (μs)
     sigma_t = cp.sqrt(sigma_t0_2 + (2 * DL / v_d ** 2) * t)
     return sigma_t * v_d * 6  # 6 is a fudge factor
 
 
 @cuda.jit
-def get_adcs(rngs, y0, y_slope, ionization_electrons, sigma_xs, adcs):
+def get_adcs(rngs: DeviceNDArray, y0: np.float32, y_slope: np.float32, ionization_electrons: cp.ndarray,
+             sigma_xs: cp.ndarray, adcs: cp.ndarray):
+    """Generate (wire, tick) coordinates for each electron in this event.
+
+    :param rngs: numba cuda rng states, must be at least MAX_IONIZATION_ELECTRONS states
+    :param y0: start tick
+    :param y_slope: tick slope as z increases
+    :param ionization_electrons: How many ionization electrons were generated at each simulation step along the detector
+    :param sigma_xs: The width of the Gaussian at each sim step along the detector
+    :param adcs: A 3d cp.ndarray, with shape (n_steps, MAX_IONIZATION_ELECTRONS, 2) to be filled. Each step along the
+    detector, the `adcs[step_num]` will be filled with an array of pairs `ionization_electrons[step_num]` long.
+    """
+    # todo I think this will have to take into account smaller step size?
     z = cuda.grid(1)
     if z < n_steps:
         y = y0 + y_slope * z
         sigma_x = sigma_xs[z]
         ionization_electrons = ionization_electrons[z]
+        # each ionization electron gets put to a random (wire, tick) offset
         for i in range(ionization_electrons):
+            # todo I think both wire & tick need to be converted from cm to wire/tick
             # wire, gaussian distributed around the current wire (z)
             wire = sigma_x * xoroshiro128p_normal_float32(rngs, z)
             wire += z
@@ -274,12 +329,21 @@ def get_adcs(rngs, y0, y_slope, ionization_electrons, sigma_xs, adcs):
                 adcs[z][i][1] = tick
 
 
+# The higher this number, the more we benefit from GPU parallelism
+# The lower this number, the fewer arrays we still have to sum at the end
+# 128 is an experimentally chosen pretty good number
 CHUNKS = 128
 print(f'CHUNKS = {CHUNKS}')
 
 
 @cuda.jit
-def add_to_noise(adcs, noise_partial_reduction):
+def add_to_noise(adcs: cp.ndarray, noise_partial_reduction: cp.ndarray):
+    """Add adcs to the noise array, `CHUNKS` simulation steps at a time
+
+    :param adcs: A 3d cp.ndarray of electron readout positions, with shape (n_steps, MAX_IONIZATION_ELECTRONS, 2)
+    :param noise_partial_reduction: a 2d cp.ndarray, with shape (CHUNKS, nwires, nticks) to be filled. Calling this
+    kernel essentially creates `CHUNKS` new event arrays, which can then be summed together afterwords.
+    """
     idx = cuda.grid(1)
 
     if idx < CHUNKS:
@@ -291,13 +355,17 @@ def add_to_noise(adcs, noise_partial_reduction):
                     noise_partial_reduction[idx][wire][tick] += 1
 
 
-def simulate_track(event, x0, y0, x1, y1, rng_states):
+def simulate_track(event: cp.ndarray, x0: float, y0: float, x1: float, y1: float, rng_states: DeviceNDArray):
     """Simulates a mCP crossing the detector, from (x0, y0) to (x1, y1)
-
-    Modifies `noise` in place.
+    :param event: A 2d (nticks, nwires) cp.ndarray of noise
+    :param x0: Start wire
+    :param y0: Start tick
+    :param x1: End wire
+    :param y1: End tick
+    :param rng_states: numba cuda rng states, must be at least MAX_IONIZATION_ELECTRONS states
     """
-
     # random energy losses
+    # todo the energy loss has to scale down with smaller step size, cuz this is currently using dEdx as just dE already
     energy_losses_d = gpu_random.landau_rvs(n_steps, dEdx_mean, dEdx_mean / width_factor, rng_states)
 
     # get # of ionization electrons
@@ -311,23 +379,37 @@ def simulate_track(event, x0, y0, x1, y1, rng_states):
 
     # get individual
     y_slope = (y1 - y0) / n_steps
+    # for reach simulation step, allocates a list of pairs
     adcs_d = cp.full((n_steps, MAX_IONIZATION_ELECTRONS, 2), -1, dtype=np.int32)
     get_adcs.forall(n_steps)(rng_states, y0, y_slope, ionization_electrons_d, sigma_xs_d, adcs_d)
-    # adcs /= electrons_per_adc
 
     # reduce
     noise_partial_reduction_d = cp.zeros((CHUNKS, nwires, nticks), np.float32)
     add_to_noise.forall(CHUNKS)(adcs_d, noise_partial_reduction_d)
+
+    # todo this could potentially be sped up with a second GPU kernel to go from like 200 -> 1
 
     reduced = noise_partial_reduction_d.sum(axis=0)
     reduced /= electrons_per_adc
     event += reduced
 
 
-# implementation from paper cited in `skimage.draw.line_aa`:
-# Listing 16 of http://members.chello.at/easyfilter/Bresenham.pdf
 @cuda.jit(device=True)
-def sum_along_line(x0, y0, x1, y1, event, aa, normalize):
+def sum_along_line(x0: np.float32, y0: np.float32, x1: np.float32, y1: np.float32, event: cp.ndarray, aa: bool,
+                   normalize: bool):
+    """Sum value at each point in `event` connecting (x0, y0) to (x1, y1).
+    Implementation from paper cited in `skimage.draw.line_aa`: 
+    Listing 16 of http://members.chello.at/easyfilter/Bresenham.pdf
+
+    :param x0: Start x (wire) coordinate
+    :param y0: Start y (ticK) coordinate
+    :param x1: End x (wire) coordinate
+    :param y1: End y (tick) coordinate
+    :param event: A 2d `(nwires, nticks)` cp.ndarray with at least one track
+    :param aa: Whether to anti-alias line
+    :param normalize: Whether to normalize sum by line length
+    :return: 
+    """
     total = 0
     npoints = 0
     dx = abs(x1 - x0)
@@ -374,14 +456,25 @@ threads = 1024
 ticks_per_block = threads // tick_separation
 # number of blocks
 blocks = math.ceil(nticks / ticks_per_block)
-
+# target min height in ticks
 y_min_t = y_min / dtick
 
 
 @cuda.jit
-def make_tracks_kern(event, sums, aa, normalize):
+def track_sums_kern(event: cp.ndarray, sums: cp.ndarray, aa: bool, normalize: bool):
+    """Kernel to calculate sum along each line in event pointing back to the target.
+
+    This kernel only calculates sums at pairs that can point back to the target, and doesn't touch the rest.
+
+    :param event: A 2d (nwires, nticks) cp.ndarray with at least one track
+    :param sums: A 2d (nticks, nticks) cp.ndarray to be filled in
+    :param aa: Whether to antialias line
+    :param normalize: Whether to normalize sums by line length
+    """
+    # tid runs from `0` to `1023` (`threads - 1`),
     # cuda.grid(1) == cuda.threadIdx + cuda.blockIdx.x * cuda.blockDim.x
     tid = cuda.threadIdx.x
+    # todo document this once I understand lol
     if tid < ticks_per_block * tick_separation:
         end = tid // tick_separation + cuda.blockIdx.x * ticks_per_block
         start = y_min_t + (abs(target) / (abs(target) + length_wires)) * (end - y_min_t)
@@ -391,8 +484,16 @@ def make_tracks_kern(event, sums, aa, normalize):
 
 
 def track_sums(event):
+    """
+    Get sums along the lines connecting each (start, end) pair that is on a line pointing back to the target. Pairs not
+    pointing back to the target get a value of `-1`.
+
+    :param event: A (nwires, nticks) cp.ndarray with at least one track.
+    :return: A (nticks, nticks) cp.ndarray of sums along lines along (start, end)
+    """
     sums_d = cp.full((nticks, nticks), -1, np.float32)
-    make_tracks_kern[blocks, threads](event, sums_d, True, True)
+    # always antialias line, always normalize the sums
+    track_sums_kern[blocks, threads](event, sums_d, True, True)
     return sums_d
 
 
@@ -401,7 +502,7 @@ track_seed, pairs_seed = np_rng.integers(np.iinfo(np.uint64).max, size=2, dtype=
 
 track_rng = create_xoroshiro128p_states(n_steps, seed=track_seed)
 iters = 100
-timing  = np.empty((5, iters))
+timing = np.empty((5, iters))
 n_times_noise_used = 10
 
 time_all = True
@@ -437,6 +538,7 @@ time_all = True
 # compile all kernels
 y0, y1 = np.array([2021, 2109], dtype=np.float32)
 event = gen_noise()
+print(f'event.shape = {event.shape}')
 shuffle_noise(event)
 simulate_track(event, 0, y0, n_steps - 1, y1, track_rng)
 sums = track_sums(event)

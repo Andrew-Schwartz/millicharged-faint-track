@@ -15,7 +15,7 @@ from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform
 
 @cuda.jit(device=True)
 def uniform(rng, idx, low, high):
-    """Random integer in range [low, high)"""
+    """Random float32 in range [low, high)"""
     r = xoroshiro128p_uniform_float32(rng, idx)
     return r * (high - low) + low
 
