@@ -1,16 +1,33 @@
+import argparse
 import os
+
+import matplotlib.pyplot as plt
+
+parser = argparse.ArgumentParser('millicharged particle faint tracks')
+parser.add_argument('chunks', type=int, help='how many chunks to use for `simulate_tracks`')
+parser.add_argument('threads', type=int, help='how many threads to use for `track_sum`, 1024 is the max', default=32)
+parser.add_argument('--iters', type=int, help='number of iterations to run', default=100)
+parser.add_argument('-z', type=float, help='charge of mCP', default=1.0)
+parser.add_argument('--mode', choices=['bench', 'profile', 'chunks', 'threads', 'run'], default='bench',
+                    help='mostly used to determine what to print')
+parser.add_argument('--no-time-all', action='store_false')
+parser.add_argument('--gpu', type=int, default=3, required=False, help='which GPU to use, 0-3 on spsfarm')
+args = parser.parse_args()
+mode = args.mode
+iters = args.iters
+
+# select which gpu to use (this has to be done before any gpu functions are imported)
+os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+
 from time import perf_counter_ns
-
-# select which gpu to use
-os.environ['CUDA_VISIBLE_DEVICES'] = "1,2"
-
 import math
 import numpy as np
-from numba import cuda, vectorize, NumbaPerformanceWarning, njit
-from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_normal_float32
+from numba import cuda, NumbaPerformanceWarning, njit
+from numba.cuda.random import create_xoroshiro128p_states
 from numba.cuda.cudadrv.devicearray import DeviceNDArray
 import warnings
 import cupy as cp
+from cupy.random import RandomState
 from cucim.skimage.feature import peak_local_max
 
 import gpu_random
@@ -40,8 +57,9 @@ length_target = 74  # cm
 # calculation of the maximum distance between the points on the front side for any point on the back side
 # https://www.desmos.com/calculator/gncrncjxhi
 
+# nopython jit so that it can be used on CPU & as a device function
 @njit(nogil=True)
-def intercept(y_end: float, back: bool, y: float) -> float:
+def intercept(y_end: cp.float32, back: bool, y: cp.float32) -> cp.float32:
     """
     For a given height (cm) on far side of the detector, calculate the point on the close side that is on a line between
     the far point and one of four boundary points of the target.
@@ -55,8 +73,8 @@ def intercept(y_end: float, back: bool, y: float) -> float:
     return slope * (target + back_length) + y
 
 
-@cuda.jit
-def intercept_kern(y_end: cp.ndarray, back: cp.ndarray, y: float, out: cp.ndarray):
+@cuda.jit(fastmath=True)
+def intercept_kern(y_end: cp.ndarray, back: cp.ndarray, y: cp.float32, out: cp.ndarray):
     """
     Calculate the intercept for many `y_end`s at once.
     """
@@ -65,7 +83,7 @@ def intercept_kern(y_end: cp.ndarray, back: cp.ndarray, y: float, out: cp.ndarra
         out[idx] = intercept(y_end[idx], back[idx], y)
 
 
-def delta_ticks(y_end: float) -> float:
+def delta_ticks(y_end: cp.float32) -> int:
     """
     For a given height (cm) on the far side of the detector, calculate how many ticks are between the points on the
     close side of the detector on lines from that far side point to the top/bottom of the target.
@@ -82,12 +100,13 @@ def delta_ticks(y_end: float) -> float:
 # or a point between y_min and y_max (all such points have same separation)
 tick_separation = max(delta_ticks(y_end) for y_end in [0, y_min + 1, length_ticks])
 
+
 # if tick_separation <= 1024, can fit each row into one block
 # if tick_separation <= ~25, can fit entire track sum on gpu
-print(f'tick_separation = {tick_separation}')
+# print(f'tick_separation = {tick_separation}')
 
 
-@cuda.jit
+@cuda.jit(fastmath=True)
 def get_start_end_pairs_kern(rng_states: DeviceNDArray, pairs: cp.ndarray):
     """Populate `pairs` with pairs of (start, end) ticks that form a line to the target.
 
@@ -138,8 +157,8 @@ samplerate = 1000 * (1 / clock_freq)
 
 # from SBNDuBooNEDataDrivenNoiseService_service.cc
 noise_function_parameters[6] = 0.395 + 0.001304 * wirelength
-nfp0, nfp1, nfp2, nfp3, nfp4, nfp5, nfp6, nfp7, nfp8 = noise_function_parameters
-binwidth = 1 / (ntick * samplerate * 1e-6)
+nfp0, nfp1, nfp2, nfp3, nfp4, nfp5, nfp6, nfp7, nfp8 = np.array(noise_function_parameters, dtype=cp.float32)
+binwidth = cp.float32(1 / (ntick * samplerate * 1e-6))
 
 DL = 3.74  # cm²/s (longitudinal electron diffusion coeff)
 DL = DL * 1e-6  # cm²/μs (longitudinal electron diffusion coeff)
@@ -148,6 +167,12 @@ v_d = v_d * 1e-1  # cm/μs (drift velocity)
 sigma_t0_2 = 1.98  # μs² (time width)
 E = 273.9  # V/cm (E field)
 
+width = 200  # cm (x)
+height = 400  # cm (y)
+length = 500  # cm (beam direction, z)
+n_steps = nwires  # number, should be at least nwires
+step_length = dwire * nwires / n_steps  # cm
+
 # from https://lar.bnl.gov/properties/
 energy_per_electron = 23.6  # eV/e⁻ pair
 # from https://arxiv.org/pdf/1802.08709.pdf or https://arxiv.org/pdf/1804.02583.pdf
@@ -155,14 +180,11 @@ electrons_per_adc = 187  # e⁻/ADC
 survival_probability = 0.6980  # % (survive recombination)
 dEdx_mean = 2.1173  # MeV/cm
 # dEdx_mean = dEdx_mean * 1e6 # eV/cm
-z = 1  # % (mCP charge fraction)
-dEdx_mean *= z ** 2  # scale based on charge
+dE_mean = dEdx_mean * step_length
+z = args.z  # % (mCP charge fraction)
+dE_mean *= z ** 2  # scale based on charge
+dE_mean = cp.float32(dE_mean)
 # print("dEdx_mean = ", dEdx_mean)
-
-width = 200  # cm (x)
-height = 400  # cm (y)
-length = 500  # cm (beam direction, z)
-n_steps = nwires  # number
 
 # magic number to get shape of landau distribution right
 width_factor = 10
@@ -171,27 +193,32 @@ energy_loss_cutoff = 1e5
 
 
 @cp.fuse
-def pfn_f1(x):
+def pfn_f1(x: cp.float32) -> cp.float32:
     """
     from SBNDuBooNEDataDrivenNoiseService_service.cc
     """
-    term1 = nfp0 * 1 / (x / 1000 * nfp8 / 2)
-    term2 = nfp1 * cp.power(cp.e, (-0.5 * cp.power((((x / 1000 * nfp8 / 2) - nfp2) / nfp3), 2)))
-    term3 = cp.power(cp.e, (-0.5 * cp.power(x / 1000 * nfp8 / (2 * nfp4), nfp5)))
+    term1 = nfp0 * cp.float32(1) / (x / cp.float32(1000) * nfp8 / cp.float32(2))
+    term2 = nfp1 * cp.power(cp.float32(cp.e), (
+            -cp.float32(0.5) * cp.power((((x / cp.float32(1000) * nfp8 / cp.float32(2)) - nfp2) / nfp3),
+                                        cp.float32(2))))
+    term3 = cp.power(cp.float32(cp.e),
+                     (-cp.float32(0.5) * cp.power(x / cp.float32(1000) * nfp8 / (cp.float32(2) * nfp4), nfp5)))
     return (term1 + (term2 * term3) * nfp6) + nfp7
 
 
 @cp.fuse
-def calc_noise_frequency_along_wire(tick, poisson_number, phase):
+def calc_noise_frequency_along_wire(tick: cp.float32, poisson_number: cp.float32, phase: cp.float32) -> cp.complex64:
     """
     from SBNDuBooNEDataDrivenNoiseService_service.cc
     """
-    pfnf1val = pfn_f1((tick + 0.5) * binwidth)
+    pfnf1val = pfn_f1((tick + cp.float32(0.5)) * binwidth).astype(cp.float32)
     pval = pfnf1val * poisson_number
-    return pval * cp.cos(phase) + 1j * pval * cp.sin(phase)
+    real = pval * cp.cos(phase)
+    imag = pval * cp.sin(phase)
+    return real.astype(cp.float32) + 1j * imag.astype(cp.float32)
 
 
-def gen_noise():
+def gen_noise(rng: RandomState):
     """Generate noise for an event.
 
     This is the starting point of the simulation.
@@ -201,31 +228,31 @@ def gen_noise():
     # from sbndcode
     poisson_mu = 3.30762
     # generate the poisson random numbers
-    poisson_random = cp.random.poisson(poisson_mu, nwires * nticks, dtype=np.float32) / poisson_mu
-    # cp.random.poisson can only generate 1d arrays, so reshape it to be 2d (same total size, so doesn't copy)
-    poisson_random = cp.reshape(poisson_random, (nwires, nticks))
+    poisson_random = rng.poisson(poisson_mu, size=(nwires, nticks), dtype=np.int32) / poisson_mu
 
     # generate the random phase
-    uniform_random = cp.random.uniform(0, 2 * math.pi, (nwires, nticks), dtype=np.float32)
-
+    uniform_random = rng.uniform(0, 2 * math.pi, size=(nwires, nticks), dtype=cp.float32)
     # generate tick number for each wire: (0, 1, 2, 3, 4, 5, ..., nticks - 1) copied nwires times
-    ticks = cp.tile(cp.arange(nticks, dtype=np.int16), (nwires, 1))
+    ticks = cp.tile(cp.arange(nticks, dtype=np.int32), (nwires, 1))
 
     # calculate frequencies
     noise_d = calc_noise_frequency_along_wire(ticks, poisson_random, uniform_random)
-    # kinda magic constant, but basically chosen to take the range to ±6 ADCs
     # todo figure out what the conversion should actually be
     noise_d *= 25000
 
     # inverse fourier transform each wire to get the noise
-    noise_d = cp.array([cp.real(cp.fft.ifft(channel_freqs)) for channel_freqs in noise_d])
+    noise_d = cp.real(cp.fft.ifft(noise_d, axis=0)).astype(cp.float32)
     return noise_d
 
 
-@cuda.jit
-def shuffle_noise_kern(noise, new_noise, indices, roll_amounts):
-    """
-    
+@cuda.jit(fastmath=True)
+def shuffle_noise_kern(noise: cp.ndarray, new_noise: cp.ndarray, indices: cp.ndarray, roll_amounts: cp.ndarray):
+    """Shuffle the noise array.
+    :param noise: The true (from gen_noise) noise array
+    :param roll_amounts: For each wire, how much to roll that wire (ie, shift all noise on that wire up by
+    `roll_amounts[w]` ticks and rollover resultant ticks back to the beginning of the wire)
+    :param indices: The wire index in `new_noise` for each original wire in `noise`
+    :param new_noise: Output noise array
     """
     w, t = cuda.grid(2)
     if w < nwires and t < nticks:
@@ -236,48 +263,49 @@ def shuffle_noise_kern(noise, new_noise, indices, roll_amounts):
         new_noise[new_w, new_t] = noise[w, t]
 
 
-def shuffle_noise(noise: cp.ndarray):
+def shuffle_noise(rng: RandomState, noise: cp.ndarray):
     """Take a wire noise array from gen_noise and shuffle it to make a new noise array.
 
     Running 1664 ifft's is pretty slow, so we skip those by only generating "true" noise every few runs. Instead, this
     function will rearrange the order of the wires (since each has independent noise) and will roll the noise values
     along each wire by random amounts.
 
+    :param rng: cupy rng state
     :param noise: A 2d cp.ndarray with shape (nwires, nticks) of noise generated by gen_noise
     :return: A new 2d cp.ndarray with shape (nwires, nticks)
     """
     new_noise = cp.empty_like(noise)
     # wire at noise[0] goes into new_noise[indices[0]]
     indices = cp.arange(0, nwires)
-    cp.random.shuffle(indices)
-    roll_amounts = cp.random.randint(0, nwires, size=nwires)
+    rng.shuffle(indices)
+    roll_amounts = rng.randint(0, nwires, size=nwires)
     threads = (16, 32)
     blocks = tuple(math.ceil(noise.shape[axis] / threads[axis]) for axis in [0, 1])
     shuffle_noise_kern[blocks, threads](noise, new_noise, indices, roll_amounts)
     return new_noise
 
 
-@vectorize(['int32(float32)'], target='cuda')
-def get_n_ionization_electrons(energy_loss: np.float32):
+@cp.fuse
+def get_n_ionization_electrons(energy_loss: cp.float32) -> cp.int32:
     """GPU vectorized function to convert energy losses into #s of electrons that get detected
     :param energy_loss: energy loss in MeV
     :return: num of electrons that make it to readout
     """
-    # convert to eV, get rid of negatives, and put in an upper threshold (otherwise, the
-    # long tail of the landau makes some super huge values wash everything else out)
+    # convert to eV, get rid of negatives, and put in an upper threshold (otherwise, the long tail of the landau makes
+    # some super huge values wash everything else out)
     # todo eventually ask Mastbaum if this cutoff makes sense
-    energy_loss = min(max(1e6 * energy_loss, 0), energy_loss_cutoff)
+    energy_loss = cp.minimum(cp.maximum(1e6 * energy_loss, 0), energy_loss_cutoff)
     # number of elections ionized
     n_electrons = energy_loss / energy_per_electron
     # number of electrons that make it to readout
-    return int(n_electrons * survival_probability)
+    return (n_electrons * survival_probability).astype(cp.int32)
 
 
 MAX_IONIZATION_ELECTRONS = int(energy_loss_cutoff / energy_per_electron * survival_probability)
 
 
 @cp.fuse
-def get_sigma_x(x: np.float32):
+def get_sigma_x(x: cp.float32):
     """GPU vectorized function to convert distance to readout to Gaussian width of spread
     :param x: Distance from interaction to readout plane, cm
     :return: Gaussian width, cm
@@ -290,89 +318,30 @@ def get_sigma_x(x: np.float32):
     return sigma_t * v_d * 6  # 6 is a fudge factor
 
 
-@cuda.jit
-def get_adcs(rngs: DeviceNDArray, y0: np.float32, y_slope: np.float32, ionization_electrons: cp.ndarray,
-             sigma_xs: cp.ndarray, adcs: cp.ndarray):
-    """Generate (wire, tick) coordinates for each electron in this event.
+# see benchmark_n_chunks.png
+CHUNKS = args.chunks
+# closest power of 2 >= the sqrt of CHUNKS
+adc_grids = 2 ** (math.ceil(math.sqrt(CHUNKS)) - 1).bit_length()
+adc_blocks = math.ceil(CHUNKS / adc_grids)
 
-    :param rngs: numba cuda rng states, must be at least MAX_IONIZATION_ELECTRONS states
-    :param y0: start tick
-    :param y_slope: tick slope as z increases
+
+@cuda.jit(fastmath=True)
+def adcs_noise(y0: cp.float32, y_slope: cp.float32, ionization_electrons: cp.ndarray,
+               sigma_xs: cp.ndarray, event_arrays: cp.ndarray, wire_random: cp.ndarray, tick_random: cp.ndarray):
+    """
+    :param y0: Start tick
+    :param y_slope: Tick slope as z increases
     :param ionization_electrons: How many ionization electrons were generated at each simulation step along the detector
     :param sigma_xs: The width of the Gaussian at each sim step along the detector
-    :param adcs: A 3d cp.ndarray, with shape (n_steps, MAX_IONIZATION_ELECTRONS, 2) to be filled. Each step along the
-    detector, the `adcs[step_num]` will be filled with an array of pairs `ionization_electrons[step_num]` long.
-    """
-    # todo I think this will have to take into account smaller step size?
-    z = cuda.grid(1)
-    if z < n_steps:
-        y = y0 + y_slope * z
-        sigma_x = sigma_xs[z]
-        ionization_electrons = ionization_electrons[z]
-        # each ionization electron gets put to a random (wire, tick) offset
-        for i in range(ionization_electrons):
-            # todo I think both wire & tick need to be converted from cm to wire/tick
-            # wire, gaussian distributed around the current wire (z)
-            wire = sigma_x * xoroshiro128p_normal_float32(rngs, z)
-            wire += z
-            wire = int(wire)
-
-            # tick, gaussian distributed around the current tick (y) (this is kinda weird?)
-            tick = sigma_x * xoroshiro128p_normal_float32(rngs, z)
-            # tick = tick / nticks * height
-            tick += y
-            # tick = tick / height * nticks
-            tick = int(tick)
-
-            if 0 <= wire < nwires and 0 <= tick < nticks:
-                adcs[z][i][0] = wire
-                adcs[z][i][1] = tick
-
-
-# The higher this number, the more we benefit from GPU parallelism
-# The lower this number, the fewer arrays we still have to sum at the end
-# 128 is an experimentally chosen pretty good number
-CHUNKS = 128
-print(f'CHUNKS = {CHUNKS}')
-
-
-@cuda.jit
-def add_to_noise(adcs: cp.ndarray, noise_partial_reduction: cp.ndarray):
-    """Add adcs to the noise array, `CHUNKS` simulation steps at a time
-
-    :param adcs: A 3d cp.ndarray of electron readout positions, with shape (n_steps, MAX_IONIZATION_ELECTRONS, 2)
-    :param noise_partial_reduction: a 2d cp.ndarray, with shape (CHUNKS, nwires, nticks) to be filled. Calling this
-    kernel essentially creates `CHUNKS` new event arrays, which are summed together afterwords.
-    """
-    chunk = cuda.grid(1)
-
-    if chunk < CHUNKS:
-        for idx in range(chunk, len(adcs), CHUNKS):
-            for i in range(MAX_IONIZATION_ELECTRONS):
-                wire = adcs[idx][i][0]
-                tick = adcs[idx][i][1]
-                if 0 <= wire < nwires and 0 <= tick < nticks:
-                    noise_partial_reduction[chunk][wire][tick] += 1
-
-
-@cuda.jit
-def adcs_noise(rngs: DeviceNDArray, y0: np.float32, y_slope: np.float32, ionization_electrons: cp.ndarray,
-               sigma_xs: cp.ndarray, noise_partial_reduction: cp.ndarray):
-    """
-
-    :param rngs: numba cuda rng states, must be at least MAX_IONIZATION_ELECTRONS states
-    :param y0: start tick
-    :param y_slope: tick slope as z increases
-    :param ionization_electrons: How many ionization electrons were generated at each simulation step along the detector
-    :param sigma_xs: The width of the Gaussian at each sim step along the detector
-    :param noise_partial_reduction: a 2d cp.ndarray, with shape (CHUNKS, nwires, nticks) to be filled. Calling this
-    kernel essentially creates `CHUNKS` new event arrays, which are summed together afterwords.
+    :param event_arrays: A 2d cp.ndarray, with shape `(CHUNKS, nwires, nticks)` to be filled. Calling this
+    kernel essentially creates `CHUNKS` new event arrays, to be summed together afterwords
+    :param tick_random: For each simulation step, an array of `MAX_IONIZATION_ELECTRONS` Gaussian wire offsets
+    :param wire_random: For each simulation step, an array of `MAX_IONIZATION_ELECTRONS` Gaussian tick offsets
     """
     chunk = cuda.grid(1)
     if chunk < CHUNKS:
         for idx in range(chunk, n_steps, CHUNKS):
-            # todo take step size into account
-            z = idx
+            z = idx * nwires / n_steps
             y = y0 + y_slope * z
             sigma_x = sigma_xs[idx]
             n_electrons = ionization_electrons[idx]
@@ -380,94 +349,105 @@ def adcs_noise(rngs: DeviceNDArray, y0: np.float32, y_slope: np.float32, ionizat
             for i in range(n_electrons):
                 # todo I think both wire & tick need to be converted from cm to wire/tick
                 # wire, gaussian distributed around the current wire (z)
-                wire = sigma_x * xoroshiro128p_normal_float32(rngs, idx)
+                # wire = sigma_x * xoroshiro128p_normal_float32(rngs, idx)
+                wire = sigma_x * wire_random[idx, i]
                 wire += z
                 wire = int(wire)
 
                 # tick, gaussian distributed around the current tick (y) (this is kinda weird?)
-                tick = sigma_x * xoroshiro128p_normal_float32(rngs, idx)
+                # tick = sigma_x * xoroshiro128p_normal_float32(rngs, idx)
+                tick = sigma_x * tick_random[idx, i]
                 # tick = tick / nticks * height
                 tick += y
                 # tick = tick / height * nticks
                 tick = int(tick)
 
-                if 0 <= wire < nwires and 0 <= tick < nticks:
-                    noise_partial_reduction[chunk][wire][tick] += 1
+                # boolean logic is much faster than branching on GPU, and using atomic add was faster than normal add
+                # add 1 to that index if it is in the bounds of the event
+                cuda.atomic.add(event_arrays, (chunk, wire, tick), 0 <= wire < nwires and 0 <= tick < nticks)
 
 
-def simulate_track(event: cp.ndarray, x0: float, y0: float, x1: float, y1: float, rng_states: DeviceNDArray):
+def simulate_track(rng: RandomState, event: cp.ndarray, x0: int, y0: cp.float32, x1: int, y1: cp.float32,
+                   event_arrays_d: cp.ndarray, time_all: bool = False):
     """Simulates a mCP crossing the detector, from (x0, y0) to (x1, y1)
-    :param event: A 2d (nticks, nwires) cp.ndarray of noise
+    :param rng: cupy rng state
+    :param event: A 2d (nwires, nticks) cp.ndarray of noise
     :param x0: Start wire
     :param y0: Start tick
     :param x1: End wire
     :param y1: End tick
-    :param rng_states: numba cuda rng states, must be at least MAX_IONIZATION_ELECTRONS states
+    :param event_arrays_d: A 3d (CHUNKS, nwires, nticks) cp.ndarray, used as CHUNKS new event arrays that the event is
+    written into before being combined into `event`
+    :param time_all: whether to time the individual parts of this function
     """
     start = perf_counter_ns()
     # random energy losses
-    # todo the energy loss has to scale down with smaller step size, cuz this is currently using dEdx as just dE already
-    energy_losses_d = gpu_random.landau_rvs(n_steps, dEdx_mean, dEdx_mean / width_factor, rng_states)
+    # todo figure out better what sigma should be
+    energy_losses_d = gpu_random.landau_rvs(n_steps, dE_mean, dE_mean / width_factor, rng)
 
-    cuda.synchronize()
+    if time_all:
+        cuda.synchronize()
     stop_energy_losses = perf_counter_ns()
 
     # get # of ionization electrons
     ionization_electrons_d = get_n_ionization_electrons(energy_losses_d)
 
-    cuda.synchronize()
+    if time_all:
+        cuda.synchronize()
     stop_ionization_n = perf_counter_ns()
 
     # get sigma of normal distribution
     x_slope = (x1 - x0) / n_steps
     # distance to readout plane, cm
-    xs_d = x0 + cp.arange(n_steps, dtype=np.float32) * x_slope
+    xs_d = x0 + cp.arange(n_steps, dtype=cp.float32) * x_slope
     sigma_xs_d = get_sigma_x(xs_d)
 
-    cuda.synchronize()
+    if time_all:
+        cuda.synchronize()
     stop_sigmas = perf_counter_ns()
 
     # get individual
     y_slope = (y1 - y0) / n_steps
-    # for reach simulation step, allocates a list of pairs
-    # adcs_d = cp.full((n_steps, MAX_IONIZATION_ELECTRONS, 2), -1, dtype=np.int32)
-    # get_adcs.forall(n_steps)(rng_states, y0, y_slope, ionization_electrons_d, sigma_xs_d, adcs_d)
-
-    cuda.synchronize()
-    stop_adcs = perf_counter_ns()
 
     # reduce
-    noise_partial_reduction_d = cp.zeros((CHUNKS, nwires, nticks), np.float32)
-    # add_to_noise.forall(CHUNKS)(adcs_d, noise_partial_reduction_d)
-    adcs_noise.forall(CHUNKS)(rng_states, y0, y_slope, ionization_electrons_d, sigma_xs_d, noise_partial_reduction_d)
+    wire_random_d = rng.normal(size=(n_steps, MAX_IONIZATION_ELECTRONS), dtype=cp.float32)
+    tick_random_d = rng.normal(size=(n_steps, MAX_IONIZATION_ELECTRONS), dtype=cp.float32)
+    # reset all `CHUNKS` of the temporary arrays
+    event_arrays_d.fill(0)
+    # simulate the interactions
+    adcs_noise[adc_grids, adc_blocks](y0, y_slope, ionization_electrons_d, sigma_xs_d, event_arrays_d, wire_random_d,
+                                      tick_random_d)
 
-    cuda.synchronize()
-    stop_partial_reduction = perf_counter_ns()
+    if time_all:
+        cuda.synchronize()
+    stop_adcs = perf_counter_ns()
 
-    # todo this could potentially be sped up with a second GPU kernel to go from like 200 -> 1
+    # combine all `CHUNKS` arrays into one
+    reduced = event_arrays_d.sum(axis=0)
 
-    reduced = noise_partial_reduction_d.sum(axis=0)
-
-    cuda.synchronize()
+    if time_all:
+        cuda.synchronize()
     stop_reduction = perf_counter_ns()
 
+    # convert number of electrons into number of adc
     reduced /= electrons_per_adc
+    # add this track to the event
     event += reduced
 
-    cuda.synchronize()
+    if time_all:
+        cuda.synchronize()
     stop = perf_counter_ns()
     timings = [stop_energy_losses - start,
                stop_ionization_n - stop_energy_losses,
                stop_sigmas - stop_ionization_n,
                stop_adcs - stop_sigmas,
-               stop_partial_reduction - stop_adcs,
-               stop_reduction - stop_partial_reduction,
+               stop_reduction - stop_adcs,
                stop - stop_reduction]
     return timings
 
 
 @cuda.jit(device=True)
-def sum_along_line(x0: np.float32, y0: np.float32, x1: np.float32, y1: np.float32, event: cp.ndarray, aa: bool,
+def sum_along_line(x0: cp.float32, y0: cp.float32, x1: cp.float32, y1: cp.float32, event: cp.ndarray, aa: bool,
                    normalize: bool):
     """Sum value at each point in `event` connecting (x0, y0) to (x1, y1).
     Implementation from paper cited in `skimage.draw.line_aa`: 
@@ -522,11 +502,14 @@ def sum_along_line(x0: np.float32, y0: np.float32, x1: np.float32, y1: np.float3
     return total / npoints if normalize else total
 
 
+# see benchmark_n_threads.png
 # 1024 is the max # of threads per block
-threads = 1024
-# how many end tick values each thread is able to calculate
+threads = args.threads
+# how many end tick values each block is able to calculate (170) (all these numbers are as if threads == 1024)
 ticks_per_block = threads // tick_separation
-# number of blocks
+# the last thread per block, ignores remaining `x` threads if `x<tick_separation` (1020)
+max_thread_idx = ticks_per_block * tick_separation
+# number of blocks (20)
 blocks = math.ceil(nticks / ticks_per_block)
 # target min height in ticks
 y_min_t = y_min / dtick
@@ -544,18 +527,25 @@ def track_sums_kern(event: cp.ndarray, sums: cp.ndarray, aa: bool, normalize: bo
     :param normalize: Whether to normalize sums by line length
     """
     # tid runs from `0` to `1023` (`threads - 1`),
+    # bid runs from `0` to `19` (`blocks - 1`)
     # cuda.grid(1) == cuda.threadIdx + cuda.blockIdx.x * cuda.blockDim.x
     tid = cuda.threadIdx.x
-    # todo document this once I understand lol
-    if tid < ticks_per_block * tick_separation:
-        end = tid // tick_separation + cuda.blockIdx.x * ticks_per_block
+    # check that the thread in bounds
+    if tid < max_thread_idx:
+        # for these comments, threads==1024 and tick_separation==6
+        # end tick is (0 to 169, 6 at a time) + (one of 0, 170, 340, 510, etc)
+        # so (0) + (0) = 0 happens 6 times, then (1) + (0) = 1 happens 6 times, ..., (169) + (0) = 169 happens 6 times
+        # then, block 1 happens, so each of those is increased by 170
+        end = (tid // tick_separation) + (cuda.blockIdx.x * ticks_per_block)
+        # y = b + mx, where x = end - y_min_t (?)
         start = y_min_t + (abs(target) / (abs(target) + length_wires)) * (end - y_min_t)
+        # round start, and then get increase it by 0, 1, 2, 3, 4, or 5 to get from y_min_t to y_max_t
         start = round(start) + tid % tick_separation
         if start < nticks:
             sums[start, end] = sum_along_line(0, start, nwires - 1, end, event, aa, normalize)
 
 
-def track_sums(event):
+def track_sums(event: cp.ndarray):
     """
     Get sums along the lines connecting each (start, end) pair that is on a line pointing back to the target. Pairs not
     pointing back to the target get a value of `-1`.
@@ -563,86 +553,92 @@ def track_sums(event):
     :param event: A (nwires, nticks) cp.ndarray with at least one track.
     :return: A (nticks, nticks) cp.ndarray of sums along lines along (start, end)
     """
-    sums_d = cp.full((nticks, nticks), -1, np.float32)
+    sums_d = cp.full((nticks, nticks), -1, cp.float32)
     # always antialias line, always normalize the sums
     track_sums_kern[blocks, threads](event, sums_d, True, True)
     return sums_d
 
 
 np_rng = np.random.default_rng()
-track_seed, pairs_seed = np_rng.integers(np.iinfo(np.uint64).max, size=2, dtype=np.uint64)
+pairs_seed = np_rng.integers(np.iinfo(np.uint64).max, dtype=np.uint64)
 
-track_rng = create_xoroshiro128p_states(n_steps, seed=track_seed)
-iters = 100
+# method = args.rng
+cp_rng = cp.random.RandomState()
+
+# track_rng = create_xoroshiro128p_states(n_steps, seed=track_seed)
 timing = np.empty((6, iters))
-n_times_noise_used = 10
+n_times_noise_used = 5
 
-time_all = True
+time_all = args.no_time_all and mode != 'run'
 
-# # Generating 50 million pairs takes about 0.25 seconds, so it will easily be done by the time that
-# # all the initial ~10k pairs are fully simulated. Can't go much higher because of memory limits.
-# n_pairs = 100
-# with cuda.gpus[1]:
-#     print('random pairs on gpu:', cuda.current_context().device.id)
-#     pairs_rng = create_xoroshiro128p_states(n_pairs, seed=pairs_seed)
-#     pairs = get_start_end_pairs(10, pairs_rng).get()
-#
-# truth_peaks = np.empty((110, 2))
-# truth_index = 0
-# found_peaks = np.empty((110, 2))
-# found_index = 0
-# while found_index < 100:
-#     print(f'len(pairs) = {len(pairs)}')
-#     with cuda.gpus[1]:
-#         print('random pairs on gpu:', cuda.current_context().device.id)
-#         pairs_async = get_start_end_pairs(n_pairs, pairs_rng)
-#
-#     print('algorithm on gpu:', cuda.current_context().device.id)
-#     for y0, y1 in pairs:
-#         event = gen_noise()
-#         simulate_track(event, 0, y0, n_steps - 1, y1, track_rng)
-#         sums = track_sums(event)
-#         peaks = peak_local_max(sums, min_distance=1, num_peaks=1)
-#         found_peaks[found_index] = peaks.get()[0]
-#         found_index += 1
-#     print(f'len(found_peaks) = {len(found_peaks)}')
-#     # todo is there a way to move this instead of copying?
-#     for pair in pairs:
-#         truth_peaks[truth_index] = pair
-#         truth_index += 1
-#     pairs = pairs_async.get()
-#
-# print(np.linalg.norm(truth_peaks - found_peaks, axis=1))
+# preallocate some stuff
+if mode == 'profile':
+    print('START!')
+event_arrays_d = cp.empty((CHUNKS, nwires, nticks), cp.float32)
 
 # compile all kernels
-y0, y1 = np.array([2021, 2109], dtype=np.float32)
-event = gen_noise()
-print(f'event.shape = {event.shape}')
-shuffle_noise(event)
-simulate_track(event, 0, y0, n_steps - 1, y1, track_rng)
+y0, y1 = np.array([2021, 2109], dtype=cp.float32)
+if mode == 'profile':
+    print('START: gen_noise')
+event = gen_noise(cp_rng)
+if mode == 'profile':
+    print('START: shuffle_noise')
+shuffle_noise(cp_rng, event)
+if mode == 'profile':
+    print('START: simulate_track')
+simulate_track(cp_rng, event, 0, y0, n_steps - 1, y1, event_arrays_d)
+if mode == 'profile':
+    print('START: track_sums')
 sums = track_sums(event)
-peak_local_max(sums, min_distance=1, num_peaks=1)
 
-print(f'Timing {"individual parts, " if time_all else ""}{iters} iterations')
+# plt.imshow(sums.get().T, interpolation='none', cmap='winter')
+# # plt.colorbar()
+# # plt.axis('off')
+# plt.tight_layout()
+# plt.savefig('sums.png', dpi=500)
+# plt.show()
 
-sim_track_timings = np.empty((7, iters))
+if mode == 'profile':
+    print('START: peak_local_max')
+peaks = peak_local_max(sums, min_distance=1, num_peaks=1)
+
+if mode == 'profile':
+    print("DONE!")
+    exit(0)
+
+if mode == 'bench' or mode == 'run':
+    print(f'{"Timing" if mode == "bench" else "Running"} {"individual parts, " if time_all else ""}{iters} iterations')
+
+sim_track_timings = np.empty((6, iters))
+
+pairs_rng = create_xoroshiro128p_states(iters, seed=pairs_seed)
+truth_pairs = get_start_end_pairs(iters, pairs_rng).get()
+found_pairs = np.empty_like(truth_pairs)
 
 stored_noise = None
 for i in range(iters):
+    if mode == 'run':
+        if i % 100 == 0:
+            # \r so the line just updates
+            print(f'{i / iters * 100:.1f}% done   ', end='\r')
+        elif i == iters - 1:
+            print('100% done   ')
+
     start = perf_counter_ns()
 
     if i % n_times_noise_used == 0:
-        event = gen_noise()
+        event = gen_noise(cp_rng)
     else:
-        event = shuffle_noise(stored_noise)
+        event = shuffle_noise(cp_rng, stored_noise)
     if time_all:
         cuda.synchronize()
     stop_gen_noise = perf_counter_ns()
 
-    sim_track_timing = simulate_track(event, 0, y0, n_steps - 1, y1, track_rng)
-    for idx, t in enumerate(sim_track_timing):
-        sim_track_timings[idx, i] = t
+    y0, y1 = truth_pairs[i]
+    sim_track_timing = simulate_track(cp_rng, event, 0, y0, n_steps - 1, y1, event_arrays_d, time_all)
     if time_all:
+        for idx, t in enumerate(sim_track_timing):
+            sim_track_timings[idx, i] = t
         cuda.synchronize()
     stop_sim_track = perf_counter_ns()
 
@@ -656,7 +652,8 @@ for i in range(iters):
         cuda.synchronize()
     stop_plm = perf_counter_ns()
 
-    get_from_device = peaks.get()[0]
+    found_peak = peaks[0].get()
+    found_pairs[i] = found_peak
     if time_all:
         cuda.synchronize()
     stop_get = perf_counter_ns()
@@ -676,17 +673,52 @@ for i in range(iters):
 timing *= 1e-6
 sim_track_timings *= 1e-6
 
-print(f"              Elapsed time: {timing[0].mean():.3f} ± {timing[0].std():.3f} ms")
-if time_all:
-    print(f"  Elapsed time (gen_noise): {timing[1].mean():.3f} ± {timing[1].std():.3f} ms")
-    print(f"  Elapsed time (sim_track): {timing[2].mean():.3f} ± {timing[2].std():.3f} ms")
-    print(f"    sim_track::energy_losses: {sim_track_timings[0].mean():.3f} ± {sim_track_timings[0].std():.3f}")
-    print(f"     sim_track::n_ionization: {sim_track_timings[1].mean():.3f} ± {sim_track_timings[1].std():.3f}")
-    print(f"           sim_track::sigmas: {sim_track_timings[2].mean():.3f} ± {sim_track_timings[2].std():.3f}")
-    print(f"             sim_track::adcs: {sim_track_timings[3].mean():.3f} ± {sim_track_timings[3].std():.3f}")
-    print(f"   sim_track::partial_reduce: {sim_track_timings[4].mean():.3f} ± {sim_track_timings[4].std():.3f}")
-    print(f"      sim_track::full_reduce: {sim_track_timings[5].mean():.3f} ± {sim_track_timings[5].std():.3f}")
-    print(f"     sim_track::add_to_event: {sim_track_timings[6].mean():.3f} ± {sim_track_timings[6].std():.3f}")
-    print(f"  Elapsed time (track_sum): {timing[3].mean():.3f} ± {timing[3].std():.3f} ms")
-    print(f"        Elapsed time (plm): {timing[4].mean():.3f} ± {timing[4].std():.3f} ms")
-    print(f"        Elapsed time (get): {timing[5].mean():.3f} ± {timing[5].std():.3f} ms")
+if mode == 'chunks':
+    print(
+        f"{CHUNKS} {sim_track_timings[3].mean():.3f} {sim_track_timings[3].std():.3f} {sim_track_timings[4].mean():.3f}"
+        f" {sim_track_timings[4].std():.3f}")
+
+if mode == 'threads':
+    print(f"{threads} {blocks} {timing[3].mean():.3f} {timing[3].std():.3f}")
+
+if mode == 'bench':
+    print(f"              Elapsed time: {timing[0].mean():.3f} ± {timing[0].std():.3f} ms")
+    if time_all:
+        print(f"  Elapsed time (gen_noise): {timing[1].mean():.3f} ± {timing[1].std():.3f} ms")
+        print(f"  Elapsed time (sim_track): {timing[2].mean():.3f} ± {timing[2].std():.3f} ms")
+        # print(f"    sim_track::energy_losses: {sim_track_timings[0].mean():.3f} ± {sim_track_timings[0].std():.3f}")
+        # print(f"     sim_track::n_ionization: {sim_track_timings[1].mean():.3f} ± {sim_track_timings[1].std():.3f}")
+        # print(f"           sim_track::sigmas: {sim_track_timings[2].mean():.3f} ± {sim_track_timings[2].std():.3f}")
+        # print(f"             sim_track::adcs: {sim_track_timings[3].mean():.3f} ± {sim_track_timings[3].std():.3f}")
+        # print(f"      sim_track::full_reduce: {sim_track_timings[4].mean():.3f} ± {sim_track_timings[4].std():.3f}")
+        # print(f"     sim_track::add_to_event: {sim_track_timings[5].mean():.3f} ± {sim_track_timings[5].std():.3f}")
+        print(f"  Elapsed time (track_sum): {timing[3].mean():.3f} ± {timing[3].std():.3f} ms")
+        print(f"        Elapsed time (plm): {timing[4].mean():.3f} ± {timing[4].std():.3f} ms")
+        print(f"        Elapsed time (get): {timing[5].mean():.3f} ± {timing[5].std():.3f} ms")
+
+if mode == 'bench' or mode == 'run':
+    dists = np.linalg.norm(found_pairs - truth_pairs, axis=1)
+    print(f'z = {z}')
+    print(f'len(dists) = {len(dists)}')
+    dists = dists[dists < 5]
+    print(f'len(dists) = {len(dists)}')
+
+    print(f'np.min(dists) = {np.min(dists)}')
+    print(f'np.max(dists) = {np.max(dists)}')
+    fig, ax = plt.subplots()
+    mu = dists.mean()
+    sigma = dists.std()
+    textstr = '\n'.join((
+        r'$\mu=%.2f$' % (mu,),
+        r'$\sigma=%.2f$' % (sigma,)))
+
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+    ax.text(0.81, 0.95, textstr, transform=ax.transAxes, fontsize=14,
+            verticalalignment='top', bbox=props)
+
+    ax.hist(dists, edgecolor='white')
+    ax.set_title(f'Distance from truth, {iters} points')
+    ax.set_xlabel('Distance [cm]')
+    ax.set_ylabel('Count')
+    plt.show()
+    plt.savefig(f"dist_q={z}.png")

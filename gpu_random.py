@@ -1,17 +1,10 @@
-from numba import cuda
-import cupy as cp
-import numpy as np
 import math
 
-from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
+import numpy as np
+from cupy.random import RandomState
+from numba import cuda
+from numba.cuda.random import xoroshiro128p_uniform_float32
 
-
-# Uniform Distribution
-# @cuda.jit(device=True)
-# def integer(rng, id, low, high):
-#     """Random integer in range [low, high)"""
-#     # todo
-#     return xoroshiro128p_uniform_float32(rng, id)
 
 @cuda.jit(device=True)
 def uniform(rng, idx, low, high):
@@ -20,37 +13,9 @@ def uniform(rng, idx, low, high):
     return r * (high - low) + low
 
 
-# Poisson Distribution
-below_one = 1 - np.finfo(np.float32).eps
-
-
-@cuda.jit(device=True)
-def poisson_random(rng, id, lam):
-    """Return a random number for a Poisson with λ=`lam`.
-
-    See https://en.wikipedia.org/wiki/Poisson_distribution#Random_variate_generation for details,
-    this is the last algorithm in that section.
-    """
-    uniform_rand = xoroshiro128p_uniform_float32(rng, id) * below_one
-    x = 0
-    s = p = math.exp(-lam)
-    while uniform_rand > s:
-        x += 1
-        p *= lam / x
-        s += p
-    return x
-
-
-@cuda.jit
-def poisson_rvs_1d(out, lam, rng):
-    id = cuda.grid(1)
-    if id < len(out):
-        out[id] = poisson_random(rng, id, lam)
-
-
 # Landau Distribution
 
-f = cp.array([
+f = np.array([
     0, 0, 0, 0, 0, -2.244733,
     -2.204365, -2.168163, -2.135219, -2.104898, -2.076740, -2.050397,
     -2.025605, -2.002150, -1.979866, -1.958612, -1.938275, -1.918760,
@@ -217,12 +182,13 @@ f = cp.array([
     28.365274, 29.068370, 29.808638, 30.589157, 31.413354, 32.285060,
     33.208568, 34.188705, 35.230920, 36.341388, 37.527131, 38.796172,
     40.157721, 41.622399, 43.202525, 44.912465, 46.769077, 48.792279,
-    51.005773, 53.437996, 56.123356, 59.103894])
+    51.005773, 53.437996, 56.123356, 59.103894],
+    dtype=np.float32)
 assert len(f) == 982
 
 
-@cuda.jit(device=True)
-def landau_quantile(z, xi, f):
+@cuda.jit(device=True, fastmath=True)
+def landau_quantile(z, xi):
     """
     LANDAU quantile : algorithm from CERNLIB G110 ranlan
     with scale parameter xi
@@ -256,13 +222,13 @@ def landau_quantile(z, xi, f):
     return xi * ranlan
 
 
-@cuda.jit
-def landau_rvs_kern(rng, out, mu, sigma, f):
+@cuda.jit(fastmath=True)
+def landau_rvs_kern(out, mu, sigma):
     """
      Generate a random number following a Landau distribution
      with location parameter mu and scale parameter sigma:
           Landau( (x-mu)/sigma )
-     Note that mu is not the mpv(most probable value) of the Landa distribution
+     Note that mu is not the mpv(most probable value) of the Landau distribution
      and sigma is not the standard deviation of the distribution which is not defined.
      For mu  =0 and sigma=1, the mpv = -0.22278
 
@@ -272,19 +238,22 @@ def landau_rvs_kern(rng, out, mu, sigma, f):
      landau_quantile has been converted from CERNLIB ranlan(G110).
     """
     id = cuda.grid(1)
-    x = xoroshiro128p_uniform_float32(rng, id)
-    out[id] = mu + landau_quantile(x, sigma, f)
+    z = out[id]
+    out[id] = mu + landau_quantile(z, sigma)
 
 
-def landau_rvs(n, mu, sigma, rng=None):
-    if rng is None:
-        print("initializing landau rng")
-        seed = np.random.default_rng().integers(0, 2 ** 64)
-        rng = create_xoroshiro128p_states(n, seed)
-    elif isinstance(rng, int):
-        print(f"initializing landau rng with {rng}")
-        rng - create_xoroshiro128p_states(n, rng)
+pows_of_two = np.array([2 ** i for i in range(20)])
 
-    out = cp.empty(n, dtype=np.float32)
-    landau_rvs_kern.forall(n)(rng, out, mu, sigma, f)
-    return out
+
+def kernel_size(n: int):
+    # highest power of 2 <= sqrt(n)
+    lower = pows_of_two[pows_of_two <= math.sqrt(n)][-1]
+    upper = math.ceil(n / lower)
+    return lower, upper
+
+
+def landau_rvs(n: int, mu: np.float32, sigma: np.float32, rng: RandomState):
+    randoms = rng.uniform(size=n, dtype=np.float32)
+    threads, blocks = kernel_size(n)
+    landau_rvs_kern[blocks, threads](randoms, mu, sigma)
+    return randoms
