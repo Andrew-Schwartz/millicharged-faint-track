@@ -110,7 +110,7 @@ arrays to set the data type.
 
 ### `@cuda.jit` vs `@cp.fuse`
 
-Numba's [`@cuda.jit`](https://numba.readthedocs.io/en/stable/cuda/index.html) decorator is used to write
+Numba's [`@cuda.jit`](https://numba.readthedocs.io/en/stable/cuda/kernels.html) decorator is used to write
 arbitrary cuda kernels, which can take any arguments and don't return anything but instead modify one of
 the input arrays passed in. When called, you have to specify how many blocks per grid and threads per block will be
 launched. You can also specify `device=True` in this decorator to write a device function which can be called from one
